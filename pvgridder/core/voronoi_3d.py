@@ -953,30 +953,47 @@ def voronoi_finite_cells(
 
     # Step 3: get the cell vertices from the halfspaces intersection
     vertices_per_cell: List[NDArrayFloat] = _compute_vertices_per_cell(
-        halfspaces_per_cell, max_workers=max_workers, eps=eps
+        points, halfspaces_per_cell, max_workers=max_workers, eps=eps
     )
 
-    # TODO: keep track of the cells/faces at the domain boundary
-    # For each face => we build the halfspace + the projection on the domain and we keep
-    # the intersection of both.
+    # TODO: wrap in a function
+    # Flatten vertices before checking which are enclosed in the domain
+    # so as to beneficiate from vectorization
+    vertices_in_domain = (
+        pv.PointSet(np.vstack(vertices_per_cell))
+        .select_enclosed_points(domain)["SelectedPoints"]
+        .view(bool)
+    )
 
-    # # Step 5: Mask the cells that must be recomputed (with external vertices)
-    # ext_cell_mask = build_boundary_cells_mask(domain, vor)
-    # ext_cell_mask = ext_cell_mask.copy()
+    # Iterate the cells
+    boundary_cell_ids = []
+    # start index for the current cell in the flatten vertices
+    start_idx = 0
+    # Iterate all cells and associated vertices to check whether the cell lies fully in
+    # the domain or if it needs to be cropped.
+    for i, cell_vertices in enumerate(vertices_per_cell):
+        # update the end index for the current cell in the flatten vertices
+        end_idx = start_idx + len(cell_vertices)
+        cell_vertices_in_domain = vertices_in_domain[start_idx:end_idx]
+        # First case: all vertices are in the domain => keep the cell as it is
+        if np.all(cell_vertices_in_domain):
+            pass
+        # Case two: some vertices are outside of the domain => it the a boundary cell
+        # and it needs to be clipped.
+        else:
+            boundary_cell_ids.append(i)
+        # Note that the case with all vertices outside can not append normally so it
+        # is not tested.
 
-    # # Number of external voronoi cells
-    # n_ext_cells = np.count_nonzero(ext_cell_mask)
-    # # List of external (boundary) cells
-    # ext_cell_ids = np.arange(n_cells, dtype=np.int64)[ext_cell_mask]
-    # # List of external (boundary) cells
-    # int_cell_ids = np.arange(n_cells, dtype=np.int64)[~ext_cell_mask]
+        # update the end index for the current cell in the flatten vertices
+        start_idx = end_idx
 
-    # print(
-    #     f"There are {n_ext_cells} boundary cells over "
-    #     f"{n_cells} ({n_ext_cells / n_cells * 100.0:.2f}%)"
-    # )
-
-    # exterior_faces_idx, exterior_intersecting_faces_idx
+    n_cells = len(points)
+    n_ext_cells = len(boundary_cell_ids)
+    print(
+        f"There are {n_ext_cells} boundary cells over "
+        f"{n_cells} ({n_ext_cells / n_cells * 100.0:.2f}%)"
+    )
 
     return _build_unstructured_grid(
         vertices_per_cell,
