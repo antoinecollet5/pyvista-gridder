@@ -13,6 +13,58 @@ NDArrayFloat = npt.NDArray[np.float64]
 NDArrayInt = npt.NDArray[np.int64]
 
 
+def _make_sanity_checks(
+    points: NDArrayFloat,
+    domain: pv.PolyData,
+) -> None:
+    """
+    Check that points have shape (N, 3) and that domain is manifold.
+
+    Parameters
+    ----------
+    points: NDArrayFloat
+        Voronoi sites. Numpy array with shape (N, 3).
+    domain : pv.Polydata
+        Closed surface in which the tesselation must occur.
+
+    Raises
+    ------
+    ValueError
+        If the point cloud shape is incorrect. If the domain is not manifold or
+        if all points are not enclosed in the domain.
+    """
+
+    # Step 1: Sanity checks - check the dimension of the point cloud
+    _shape = np.shape(points)
+    if len(_shape) != 2:
+        raise ValueError(
+            f"Points have shape {_shape} while the it should have shape (N, 3)!"
+        )
+    # Number of voronoi cells and dimension
+    n_cells, dim = _shape
+    # Check that points are 3D
+    if dim != 3:
+        raise ValueError(
+            f"Points are {np.size(points[0])}D while the "
+            "code supports 3D voronoi diagram."
+        )
+
+    # Step 2: Sanity checks - check the domain
+    if not domain.is_manifold:
+        raise ValueError("`domain` is not manifold")
+
+    # Step 3: Sanity checks - check that all voronoi points are in the domain.
+    # Create a PyVista point cloud
+    if not np.all(
+        pv.PolyData(points).select_enclosed_points(domain)["SelectedPoints"].view(bool)
+    ):
+        raise ValueError(
+            "All points should be included in the domain!"
+            "Use `pv.PolyData(points).select_enclosed_points(domain)['SelectedPoints']"
+            ".view(bool)` to check which points are lying outside the domain!"
+        )
+
+
 def get_bounding_cube_coords(domain: pv.PolyData) -> NDArrayFloat:
     """
     Return the coordinates of the bounding cube with shape (3, 2).
@@ -34,63 +86,69 @@ def get_bounding_cube(domain: pv.PolyData) -> pv.Cube:
     )
 
 
-def get_voronoi_cells_adjacency(vor: sp.spatial.Voronoi) -> List[List[int]]:
-    adj = [[] for _ in range(len(vor.points))]
-    for p1, p2 in vor.ridge_points:
-        adj[p1].append(p2.item())
-        adj[p2].append(p1.item())
-    return adj
-
-
-def build_boundary_cells_mask(
-    domain: pv.PolyData, vor: sp.spatial.Voronoi
-) -> np.typing.NDArray[np.bool]:
-    # Initiate the mask
-    mask_boundary_cells = np.zeros(np.shape(vor.points)[0], dtype=np.bool)
-
-    # Mask the vertices outside the desired domain
-    outside_vertices = ~pv.PolyData(vor.vertices).select_enclosed_points(
-        domain, check_surface=True
-    )["SelectedPoints"].view(bool)
-
-    # Iterate the regions (for each voronoi cell, list of vertices ids composing the
-    # voronoi cell 3D convex hull).
-    # If -1 => means it is an "infinite" vertice
-    # If outside the domain => must be recomputed
-    for cell_id, rid in enumerate(vor.point_region):
-        for vid in vor.regions[rid]:
-            if vid == -1:
-                mask_boundary_cells[cell_id] = 1
-                continue
-            elif outside_vertices[vid]:
-                mask_boundary_cells[cell_id] = 1
-                continue
-
-    return mask_boundary_cells
-
-
-@numba.njit(parallel=True)
-def build_all_halfspaces(
+@numba.njit(parallel=True, cache=True)
+def _build_all_halfspaces_parallel_jit(
     points,
     neighbors_flat: NDArrayInt,
     neighbors_offsets: NDArrayInt,
     bbox: NDArrayFloat,
-    ext_mask: Optional[np.typing.NDArray[np.bool]] = None,
 ):
     """
-    Build halfspaces for all points in parallel.
+    Construct half-space representations for Voronoi cells in parallel.
+
+    For each input point, this function builds the set of half-spaces
+    defining its Voronoi cell. Each half-space corresponds either to
+    a bisector plane between the point and one of its neighbors, or to
+    a bounding plane of the global domain bounding cube.
+
+    The computation is parallelized over points using Numba and expects
+    a flattened adjacency representation for efficient JIT compilation.
 
     Parameters
     ----------
-    points : (N,3) array of coordinates
-    adjacency : list of arrays of neighbor indices
-    bbox : (6,4) array of bounding planes
+    points : ndarray of shape (N, 3)
+        Coordinates of the Voronoi sites.
+    neighbors_flat : ndarray of shape (M,), dtype int64
+        Flattened array of neighbor indices for all points.
+        Neighbors for point ``i`` are stored in the slice
+        ``neighbors_flat[neighbors_offsets[i]:neighbors_offsets[i+1]]``.
+    neighbors_offsets : ndarray of shape (N + 1,), dtype int64
+        Offset array delimiting the neighbors of each point in
+        ``neighbors_flat``.
+    bbox : ndarray of shape (6, 4)
+        Half-space representation of the bounding domain. Each row
+        represents a plane of the form::
+
+            a * x + b * y + c * z + d <= 0
+
+        where ``(a, b, c)`` is the outward normal and ``d`` is the offset.
 
     Returns
     -------
-    halfspaces_list : list of arrays, each (num_neighbors+6,4)
-    """
+    halfspaces_list : list of ndarray
+        List of length ``N``, N being the number of voronoi sites.
+        Each entry is an array of shape ``(num_neighbors_i + 6, 4)``
+        containing the half-space coefficients for the Voronoi cell of the
+        corresponding point.
 
+        Neighbor half-spaces are listed first, followed by the bounding
+        box planes (6 planes).
+
+    Notes
+    -----
+    * This function is compiled with ``numba.njit(parallel=True)`` and
+      is intended for high-performance batch computation.
+    * All returned half-spaces are oriented such that the corresponding
+      point satisfies the inequality.
+    * The returned Python list is allocated inside the JIT-compiled
+      function; this is supported by Numba but limits downstream
+      vectorization.
+
+    See Also
+    --------
+    scipy.spatial.HalfspaceIntersection :
+        Consumes half-space representations to compute polyhedral cells.
+    """
     n_points = points.shape[0]
     halfspaces_list = [np.empty((0, 4), dtype=np.float64) for _ in range(n_points)]
     # halfspaces_list = np.empty((n_points, 0, 4), dtype=np.float64)
@@ -121,10 +179,6 @@ def build_all_halfspaces(
             hs[j, 0:3] = n
             hs[j, 3] = b
 
-        # Bounding box: add only for external cells
-        if ext_mask is not None:
-            if not ext_mask[i]:
-                continue
         for k in range(bbox.shape[0]):
             hs[n_neighbors + k, :] = bbox[k, :]
 
@@ -133,16 +187,326 @@ def build_all_halfspaces(
     return halfspaces_list
 
 
-def build_3d_cell_local(halfspaces_i: NDArrayFloat, p: NDArrayFloat) -> NDArrayFloat:
-    hs = HalfspaceIntersection(halfspaces_i, p)
+def _build_halfspaces_per_cell(
+    points: NDArrayFloat,
+    domain: pv.PolyData,
+) -> List[NDArrayFloat]:
+    """
+    Build half-space representations of 3D Voronoi cells within a bounded domain.
+
+    This function computes the half-space inequalities defining the Voronoi
+    cell of each input point, clipped to a closed 3D domain. The workflow is:
+
+    1. Extract an axis-aligned bounding box enclosing the domain.
+    2. Compute a 3D Delaunay tetrahedralization of the input points.
+    3. Derive point adjacency from tetrahedral edges.
+    4. Construct Voronoi half-spaces in parallel using neighbor bisector planes
+       and domain bounding planes.
+
+    The resulting half-spaces can be passed directly to
+    ``scipy.spatial.HalfspaceIntersection`` for polyhedral reconstruction.
+
+    Parameters
+    ----------
+    points : ndarray of shape (N, 3)
+        Coordinates of the Voronoi sites.
+    domain : pyvista.PolyData
+        Closed surface defining the spatial domain in which the Voronoi
+        tessellation is constrained.
+
+    Returns
+    -------
+    halfspaces_per_cell : list of ndarray
+        List of length ``N``. Each element is an array of shape
+        ``(num_neighbors_i + 6, 4)`` containing the half-space coefficients
+        ``(a, b, c, d)`` such that::
+
+            a * x + b * y + c * z + d <= 0
+
+        defines the clipped Voronoi cell for the corresponding site.
+
+    Notes
+    -----
+    * The bounding domain is approximated by its axis-aligned bounding box.
+    * Neighbor relations are inferred from the Delaunay tetrahedralization,
+      which guarantees that all Voronoi-adjacent sites are included.
+    * Half-space construction is parallelized via Numba in
+      ``build_all_halfspaces_parallel_jit``.
+
+    See Also
+    --------
+    build_all_halfspaces_parallel_jit :
+        Parallel construction of Voronoi half-spaces.
+    scipy.spatial.HalfspaceIntersection :
+        Computes polyhedral intersections from half-space representations.
+    """
+    n_cells = len(points)
+
+    # Step 1: extract the domain bouding cube coordinates and create the cube
+    cube_coords = get_bounding_cube_coords(domain)
+
+    # Step 2: create a plan projection for the cube
+    bbox = np.array(
+        [
+            (-1, 0, 0, cube_coords[0, 0]),
+            (1, 0, 0, -cube_coords[0, 1]),
+            (0, -1, 0, cube_coords[1, 0]),
+            (0, 1, 0, -cube_coords[1, 1]),
+            (0, 0, -1, cube_coords[2, 0]),
+            (0, 0, 1, -cube_coords[2, 1]),
+        ]
+    )
+
+    # Step 3: Build 3D Delaunay with PyVista => tetrahedralization
+    tetra = pv.PointSet(points).delaunay_3d()
+
+    # Step 4: Extract tetrahedra connectivity
+    # VTK stores cells in a flat array:
+    # [npts, p0, p1, p2, p3, npts, p0, ...]
+    cells = tetra.cells.reshape(-1, 5)[:, 1:]
+
+    # Step 5: Build point adjacency from edges from tetrahedra
+    # Each tetrahedron has 6 edges
+    # - normalize edge ordering
+    # - remove duplicates
+    edges = np.unique(
+        np.sort(
+            np.vstack(
+                [
+                    cells[:, [0, 1]],
+                    cells[:, [0, 2]],
+                    cells[:, [0, 3]],
+                    cells[:, [1, 2]],
+                    cells[:, [1, 3]],
+                    cells[:, [2, 3]],
+                ]
+            ),
+            axis=1,
+        ),
+        axis=0,
+    )
+
+    # Step 6: Build point adjacency list
+    # adj[i] will contain the indices of all points adjacent to point i
+    # in the Delaunay tetrahedralization (i.e., Voronoi neighbors).
+    adj = [[] for _ in range(n_cells)]
+
+    # Each edge (i, j) implies mutual adjacency
+    for i, j in edges:
+        adj[i].append(j)
+        adj[j].append(i)
+
+    # Step 7: Flatten adjacency for Numba-friendly parallel processing
+    #
+    # We convert the Python list-of-lists structure into two NumPy arrays:
+    # - neighbors_flat: A single 1D array containing all neighbor indices.
+    # - neighbors_offsets: An offset array such that neighbors of point i are found in:
+    # neighbors_flat[neighbors_offsets[i] : neighbors_offsets[i + 1]]
+    #
+    # This layout avoids Python objects inside the Numba-parallel function.
+    # Compute prefix sums to determine offsets
+    neighbors_offsets = np.zeros(n_cells + 1, dtype=np.int64)
+    for i, neighbors in enumerate(adj):
+        neighbors_offsets[i + 1] = neighbors_offsets[i] + len(neighbors)
+
+    # Allocate the flattened neighbor array
+    neighbors_flat = np.empty(neighbors_offsets[-1], dtype=np.int64)
+
+    # Fill the flattened array
+    k = 0
+    for neighbors in adj:
+        neighbors_flat[k : k + len(neighbors)] = neighbors
+        k += len(neighbors)
+
+    # Step 8: finally build the halfspaces
+    return _build_all_halfspaces_parallel_jit(
+        points, neighbors_flat, neighbors_offsets, bbox
+    )
+
+
+def _build_3d_cell_local(
+    halfspaces: NDArrayFloat,
+    p: NDArrayFloat,
+) -> NDArrayFloat:
+    """
+    Compute the vertices of a single 3D Voronoi cell from its half-spaces.
+
+    This function computes the intersection points of a set of half-spaces
+    defining a convex polyhedron using
+    ``scipy.spatial.HalfspaceIntersection``.
+
+    Parameters
+    ----------
+    halfspaces_i : ndarray of shape (M, 4)
+        Half-space representation of a single Voronoi cell. Each row
+        corresponds to a plane of the form::
+
+            a * x + b * y + c * z + d <= 0
+
+    p : ndarray of shape (3,)
+        A point strictly inside the feasible region defined by
+        ``halfspaces_i``. This point is required by
+        ``HalfspaceIntersection`` as a starting point for the intersection
+        computation.
+
+    Returns
+    -------
+    vertices : ndarray of shape (V, 3)
+        Coordinates of the vertices of the convex polyhedron corresponding
+        to the Voronoi cell.
+
+    Notes
+    -----
+    * The input point ``p`` must lie strictly inside all half-spaces;
+      otherwise, the intersection computation will fail.
+    * This function operates on a single cell and is intended to be used
+      either serially or within a parallel execution context.
+
+    See Also
+    --------
+    scipy.spatial.HalfspaceIntersection :
+        Computes intersections of half-spaces defining a convex polyhedron.
+    """
+    hs = HalfspaceIntersection(halfspaces, p)
     return hs.intersections
 
 
-@numba.njit(cache=True, fastmath=True)
-def _make_plane_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _compute_vertices_per_cell(
+    points: NDArrayFloat,
+    halfspaces: List[NDArrayFloat],
+    max_workers: int = -1,
+    eps: float = 1e-5,
+) -> List[NDArrayFloat]:
     """
-    Construct a stable orthonormal basis (u, v) for a plane
-    given its normal vector n.
+    Compute Voronoi cell vertices from half-space representations.
+
+    This function computes the vertices of each Voronoi cell defined by a
+    list of half-space arrays. For numerical robustness, the site
+    coordinates are slightly perturbed to ensure they lie strictly inside
+    their corresponding half-space intersections.
+
+    Depending on the number of cells, the computation is performed either
+    serially or in parallel using a thread pool.
+
+    Parameters
+    ----------
+    points: NDArrayFloat
+        Coordinates of the Voronoi sites: ndarray of shape (N, 3).
+
+    halfspaces : list of ndarray
+        List of length ``N`` containing half-space representations of the
+        Voronoi cells. Each entry is an array of shape ``(M_i, 4)`` defining
+        planes of the form::
+
+            a * x + b * y + c * z + d <= 0
+
+    max_workers : int, optional
+        Maximum number of worker threads used for parallel computation.
+        If set to ``-1`` (default), the executor uses the system default.
+        Parallel execution is automatically disabled for small problems (number of
+        voronoi sites below 500).
+
+    eps : float, optional
+        Small positive offset added to each site coordinate to ensure that
+        the initial point lies strictly inside the feasible region.
+        Default is ``1e-5``.
+
+    Returns
+    -------
+    vertices_per_cell : list of ndarray
+        List of length ``N``. Each element is an array of shape ``(V_i, 3)``
+        containing the vertices of the corresponding Voronoi cell.
+
+    Notes
+    -----
+    * For fewer than ~500 cells, serial execution is preferred, as thread
+      management overhead outweighs parallel speedup.
+    * This function relies on ``scipy.spatial.HalfspaceIntersection``, which
+      assumes convex, bounded regions.
+    * Thread-based parallelism is used instead of multiprocessing to avoid
+      excessive memory duplication.
+
+    See Also
+    --------
+    _build_3d_cell_local :
+        Computes vertices for a single Voronoi cell.
+    scipy.spatial.HalfspaceIntersection :
+        Half-space intersection algorithm for convex polyhedra.
+    """
+    # Number of voronoi sites/cells
+    n_cells = len(halfspaces)
+
+    # if the number of external cells is below 500, no need for multi-processing (slower)
+    if n_cells < 500:
+        _max_workers: int = 1
+    else:
+        _max_workers = max_workers
+
+    # Create the halfspaces intersections
+    vertices_per_cell: List[NDArrayFloat] = []
+
+    # Single worker (no multi-processing)
+    if _max_workers == 1:
+        for cell_id in range(n_cells):
+            vertices_per_cell.append(
+                _build_3d_cell_local(halfspaces[cell_id], points[cell_id] + eps)
+            )
+    # Multi-processing enabled
+    else:
+        with ThreadPoolExecutor(max_workers=_max_workers) as executor:
+            vertices_per_cell = list(
+                executor.map(
+                    _build_3d_cell_local,
+                    halfspaces,
+                    points + eps,
+                )
+            )
+    return vertices_per_cell
+
+
+@numba.njit(cache=True, fastmath=True)
+def _make_plane_basis(n: NDArrayFloat) -> Tuple[NDArrayFloat, NDArrayFloat]:
+    """
+    Construct an orthonormal basis for a plane from its normal vector.
+
+    Given a normal vector ``n``, this function computes two orthonormal
+    vectors ``u`` and ``v`` such that:
+
+    * ``u`` and ``v`` lie in the plane orthogonal to ``n``
+    * ``u ⟂ v``
+    * ``n ⟂ u`` and ``n ⟂ v``
+
+    The basis construction is numerically stable and avoids choosing
+    vectors nearly parallel to the input normal.
+
+    Parameters
+    ----------
+    n : ndarray of shape (3,)
+        Normal vector of the plane. The vector does not need to be
+        normalized.
+
+    Returns
+    -------
+    u : ndarray of shape (3,)
+        First unit vector spanning the plane orthogonal to ``n``.
+
+    v : ndarray of shape (3,)
+        Second unit vector spanning the plane orthogonal to ``n``,
+        defined as ``v = n × u``.
+
+    Notes
+    -----
+    * The returned vectors ``u`` and ``v`` form a right-handed coordinate
+      system with ``n``.
+    * This function is compiled with ``numba.njit`` and is intended for
+      use in performance-critical inner loops.
+    * No explicit check is performed for ``n = 0``; the input normal must
+      be non-zero.
+
+    See Also
+    --------
+    numpy.cross :
+        Cross product of two vectors.
     """
     # Choose a vector not parallel to n
     if abs(n[0]) > abs(n[2]):
@@ -165,14 +529,74 @@ def _make_plane_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return u, v
 
 
-# Get face
+@numba.njit(cache=True, fastmath=True)
+def _get_face_from_halfsace(
+    vertices: np.ndarray,
+    num_vertices: int,
+    halfspace: np.ndarray,
+    tol: float = 1e-8,
+) -> np.ndarray:
+    """
+    Extract and order the polygonal face induced by a half-space.
 
+    Given a set of vertices of a convex polyhedron and a half-space
+    defining one of its supporting planes, this function identifies
+    the vertices lying on the plane and returns them ordered as a
+    planar polygon.
 
-def get_face_from_halfsace(
-    vertices: NDArrayFloat, num_vertices: int, plane: NDArrayFloat, tol: float = 1e-8
-):
-    n = plane[:3]
-    d = plane[3]
+    The ordering is performed counterclockwise in the plane defined
+    by the half-space normal.
+
+    Parameters
+    ----------
+    vertices : ndarray of shape (V, 3)
+        Coordinates of the polyhedron vertices.
+
+    num_vertices : int
+        Number of valid vertices in ``vertices``. This is provided
+        explicitly to avoid repeated shape lookups in performance-
+        critical code paths.
+
+    halfspace : ndarray of shape (4,)
+        Half-space coefficients ``(a, b, c, d)`` defining the plane::
+
+            a * x + b * y + c * z + d = 0
+
+        The plane normal is assumed to point outward.
+
+    tol : float, optional
+        Numerical tolerance used to determine whether a vertex lies
+        on the plane. Default is ``1e-8``.
+
+    Returns
+    -------
+    face_indices : ndarray of shape (F,), dtype int64
+        Indices of vertices forming the polygonal face induced by the
+        half-space, ordered counterclockwise in the plane.
+
+        If fewer than three vertices lie on the plane, ``None`` is
+        returned.
+
+    Notes
+    -----
+    * A valid face must have at least three coplanar vertices.
+    * For exactly three vertices, no reordering is necessary and the
+      indices are returned directly.
+    * For more than three vertices, the face is ordered by projecting
+      the vertices onto a local 2D basis constructed from the plane
+      normal and sorting by polar angle.
+    * This function assumes the input polyhedron is convex.
+
+    See Also
+    --------
+    _make_plane_basis :
+        Constructs an orthonormal basis for a plane.
+    numpy.argsort :
+        Indirect sort used to order vertices by angle.
+
+    """
+    n = halfspace[:3]
+    d = halfspace[3]
 
     # Collect indices of vertices lying on the plane
     tmp = np.empty(num_vertices, dtype=np.int64)
@@ -186,13 +610,15 @@ def get_face_from_halfsace(
             tmp[count] = j
             count += 1
 
+    # return something empty => the slicing is required for numba to compile
     if count < 3:
-        return
+        return tmp[:0]
 
     face_idx = tmp[:count]
 
+    # If there are only three points => triangle face and the order dos not matter
     if count == 3:
-        return face_idx.copy()
+        return np.asarray(face_idx)
 
     # ------------------------------------------------------------------
     # Order coplanar vertices
@@ -225,9 +651,9 @@ def get_face_from_halfsace(
 
 
 @numba.njit(cache=True, fastmath=True)
-def extract_faces_from_halfspaces(
-    halfspaces: np.ndarray, vertices: np.ndarray, tol: float = 1e-8
-) -> numba.typed.List[np.ndarray]:
+def _extract_faces_from_halfspaces(
+    halfspaces: NDArrayFloat, vertices: NDArrayFloat, tol: float = 1e-8
+) -> Tuple[NDArrayFloat, numba.typed.List[NDArrayInt]]:
     """
     Extract polygonal faces from a convex polyhedron defined by halfspaces.
 
@@ -250,67 +676,17 @@ def extract_faces_from_halfspaces(
         Each entry is an array of vertex indices forming a face.
         Vertices are ordered counter-clockwise in the plane.
     """
+    # Initiate an empty
     faces = numba.typed.List()
-
+    # Number of of vertices defining the voronoi cells.
     num_vertices = vertices.shape[0]
-
+    # build the faces
     for i in range(halfspaces.shape[0]):
-        plane = halfspaces[i]
-        n = plane[:3]
-        d = plane[3]
-
-        # Collect indices of vertices lying on the plane
-        tmp = np.empty(num_vertices, dtype=np.int64)
-        count = 0
-
-        for j in range(num_vertices):
-            dist = abs(
-                vertices[j, 0] * n[0]
-                + vertices[j, 1] * n[1]
-                + vertices[j, 2] * n[2]
-                + d
-            )
-            if dist < tol:
-                tmp[count] = j
-                count += 1
-
-        if count < 3:
-            continue
-
-        face_idx = tmp[:count]
-
-        if count == 3:
-            faces.append(face_idx.copy())
-            continue
-
-        # ------------------------------------------------------------------
-        # Order coplanar vertices
-        # ------------------------------------------------------------------
-
-        # Compute centroid
-        center = np.zeros(3)
-        for k in range(count):
-            center += vertices[face_idx[k]]
-        center /= count
-
-        # Plane basis
-        u, v = _make_plane_basis(n)
-
-        # Compute angles
-        angles = np.empty(count)
-        for k in range(count):
-            rel = vertices[face_idx[k]] - center
-            x = rel[0] * u[0] + rel[1] * u[1] + rel[2] * u[2]
-            y = rel[0] * v[0] + rel[1] * v[1] + rel[2] * v[2]
-            angles[k] = np.arctan2(y, x)
-
-        # Sort by angle
-        order = np.argsort(angles)
-        ordered = np.empty(count, dtype=np.int64)
-        for k in range(count):
-            ordered[k] = face_idx[order[k]]
-
-        faces.append(ordered)
+        res: NDArrayInt = _get_face_from_halfsace(
+            vertices, num_vertices, halfspaces[i], tol=tol
+        )
+        if np.size(res) != 0:
+            faces.append(res)
 
     return vertices, faces
 
@@ -367,7 +743,7 @@ def extract_faces_from_halfspaces_with_domain(
     # Step 1: find what vertices are on the bounding cube (vertices to remove)
     boundary_vertices_mask = np.zeros(num_vertices, dtype=bool)
     for i in range(6):
-        face = get_face_from_halfsace(
+        face = _get_face_from_halfsace(
             vertices, num_vertices, halfspaces[num_halfspaces - 1 - i]
         )
         if face is not None:
@@ -378,7 +754,7 @@ def extract_faces_from_halfspaces_with_domain(
 
     # If none on the bounding cube, call the classic method to build the faces.
     if np.size(boundary_vertices) == 0:
-        return extract_faces_from_halfspaces(halfspaces, vertices, tol)
+        return _extract_faces_from_halfspaces(halfspaces, vertices, tol)
 
     # remove useless vertices
     new_vertices = [vertices[boundary_vertices]]
@@ -389,7 +765,7 @@ def extract_faces_from_halfspaces_with_domain(
     # obtained.
     for i in range(num_halfspaces):
         is_cube_intersecting: bool = False
-        face = get_face_from_halfsace(vertices, num_vertices, halfspaces[i])
+        face = _get_face_from_halfsace(vertices, num_vertices, halfspaces[i])
         # Handle the case with no face for that halfspace
         if face is None:
             continue
@@ -453,17 +829,89 @@ def extract_faces_from_halfspaces_with_domain(
 
     # Step 4: merge coplanar faces (using halfspace).
     for i in kept_halfspaces_idx:
-        face = get_face_from_halfsace(vertices, num_vertices, halfspaces[i])
+        face = _get_face_from_halfsace(vertices, num_vertices, halfspaces[i])
 
     print(faces)
 
     return vertices, faces
 
 
+def _build_unstructured_grid(
+    vertices_per_cell: List[NDArrayFloat],
+    halfspaces_per_cell: List[NDArrayFloat],
+    domain: pv.PolyData,
+    is_clip_to_domain: bool = False,
+    tolerance: float = 1e-10,
+) -> pv.UnstructuredGrid:
+    """
+    Build an unstructured grid from the vertices and halfspaces of the voronoi cells.
+
+    Parameters
+    ----------
+    vertices_per_cell : List[NDArrayFloat]
+        List of vertices arrays with shape (nv_i, 3) given for each voronoi cell,
+        nv_i being the number of vertices for the ith cell.
+    halfspaces_per_cell : List[NDArrayFloat]
+        List of halfspaces arrays with shape (nv_i, 4) given for each voronoi cell,
+        nv_i being the number of halfspace for the ith cell.
+    domain : pv.PolyData
+        Voronoi domain.
+    is_clip_to_domain: bool
+        Whether the voronoi cells must be clipped to the input domain closed surface.
+        If False, then the bounding cube is used instead of the domain.
+        The default is False.
+    tolerance : float, optional
+        Tolerance for merging duplicate points and remove unused points in
+        the output UnstructuredGrid., by default 1e-10.
+
+    Returns
+    -------
+    pv.UnstructuredGrid
+
+    """
+    # Build unstructured grid
+    total_n_pts: int = 0
+    n_cells: int = 0
+    cells_def = []
+
+    for i, (_vertices, _halfspaces) in enumerate(
+        zip(vertices_per_cell, halfspaces_per_cell)
+    ):
+        # Build the faces
+        if is_clip_to_domain:
+            _vertices, faces = extract_faces_from_halfspaces_with_domain(
+                _halfspaces, _vertices, domain
+            )
+        else:
+            _vertices, faces = _extract_faces_from_halfspaces(
+                _halfspaces,
+                _vertices,
+            )
+            # Update the vertices
+            vertices_per_cell[i] = _vertices
+        # updated number of vertices for the voronoi cell
+        n_pts = len(_vertices)
+        # Add the number of faces
+        polyhedron_connectivity = [len(faces)]
+        # iterate faces and update the connectivity for each one
+        for f in faces:
+            polyhedron_connectivity += [len(f)] + list(np.array(f) + total_n_pts)
+        cells_def += [len(polyhedron_connectivity), *polyhedron_connectivity]
+        # update the total number of points
+        total_n_pts += n_pts
+        n_cells += 1
+
+    return pv.UnstructuredGrid(
+        np.array(cells_def),
+        [pv.CellType.POLYHEDRON] * n_cells,
+        np.vstack(vertices_per_cell),
+    ).clean(tolerance=tolerance)
+
+
 def voronoi_finite_cells(
     points: NDArrayFloat,
     domain: pv.PolyData,
-    eps: float = 1e-6,
+    eps: float = 1e-5,
     max_workers: int = 1,
     is_clip_to_domain: bool = False,
 ):
@@ -477,10 +925,14 @@ def voronoi_finite_cells(
     domain : pv.Polydata
         Closed surface in which the tesselation must occur.
     eps : float, optional
-        Some precision parameter, by default 1e-6. TODO: change that.
+        Small positive offset added to each site coordinate to ensure that
+        the initial point lies strictly inside the feasible region.
+        Default is ``1e-5``.
     max_workers : int, optional
-        Maximum number of workers to parallelize the code (multi-threaded),
-        by default 1, i.e., single threaded.
+        Maximum number of worker threads used for parallel computation.
+        If set to ``-1`` (default), the executor uses the system default.
+        Parallel execution is automatically disabled for small problems (number of
+        voronoi sites below 500).
     is_clip_to_domain: bool
         Whether the voronoi cells must be clipped to the input domain closed surface.
         If False, then the bounding cube is used instead of the domain.
@@ -492,104 +944,17 @@ def voronoi_finite_cells(
         The finite voronoi cells as an unstructured grid.
 
     """
-    # Number of voronoi cells and dimension
-    n_cells, dim = np.shape(points)
+    # Step 1: sanity checks
+    _make_sanity_checks(points, domain)
 
-    # check the dimension
-    if dim != 3:
-        raise ValueError(
-            f"Points are {np.size(points[0])}D while the "
-            "code supports 3D voronoi diagram."
-        )
+    # Step 2: create the halfspaces for each voronoi cell (all plans defining the cells)
+    # The arrays have shape (nb neigbors + 6, 4)
+    halfspaces_per_cell: List[NDArrayFloat] = _build_halfspaces_per_cell(points, domain)
 
-    # Step 1: extract the domain bouding cube coordinates and create the cube
-    cube_coords = get_bounding_cube_coords(domain)
-
-    # Step 2: create a plan projection for the cube
-    bbox = np.array(
-        [
-            (-1, 0, 0, cube_coords[0, 0]),
-            (1, 0, 0, -cube_coords[0, 1]),
-            (0, -1, 0, cube_coords[1, 0]),
-            (0, 1, 0, -cube_coords[1, 1]),
-            (0, 0, -1, cube_coords[2, 0]),
-            (0, 0, 1, -cube_coords[2, 1]),
-        ]
+    # Step 3: get the cell vertices from the halfspaces intersection
+    vertices_per_cell: List[NDArrayFloat] = _compute_vertices_per_cell(
+        halfspaces_per_cell, max_workers=max_workers, eps=eps
     )
-
-    # Step 3: Build 3D Delaunay with PyVista => tetrahedralization
-    tetra = pv.PointSet(points).delaunay_3d()
-
-    # Step 4: Extract tetrahedra connectivity
-    # VTK stores cells in a flat array:
-    # [npts, p0, p1, p2, p3, npts, p0, ...]
-    cells = tetra.cells.reshape(-1, 5)[:, 1:]
-
-    # Step 5: Build point adjacency from edges from tetrahedra
-    # Each tetrahedron has 6 edges
-    # - normalize edge ordering
-    # - remove duplicates
-    edges = np.unique(
-        np.sort(
-            np.vstack(
-                [
-                    cells[:, [0, 1]],
-                    cells[:, [0, 2]],
-                    cells[:, [0, 3]],
-                    cells[:, [1, 2]],
-                    cells[:, [1, 3]],
-                    cells[:, [2, 3]],
-                ]
-            ),
-            axis=1,
-        ),
-        axis=0,
-    )
-    # Initiate adjacency dict
-    adj = [[] for _ in range(tetra.n_points)]
-    # Fill the dict
-    for i, j in edges:
-        adj[i].append(j)
-        adj[j].append(i)
-
-    # TODO: update this
-    neighbors_flat = np.array(
-        [n for neighbors in adj for n in neighbors],
-        dtype=np.int64,
-    )
-    neighbors_offsets = np.zeros(n_cells + 1, dtype=np.int64)
-    offset = 0
-    for i, neighbors in enumerate(adj):
-        neighbors_offsets[i] = offset
-        offset += len(neighbors)
-    neighbors_offsets[-1] = offset
-
-    _halfspaces = build_all_halfspaces(points, neighbors_flat, neighbors_offsets, bbox)
-
-    # if the number of external cells is below 500, no need for multi-processing (slower)
-    if n_cells < 500:
-        _max_workers: int = 1
-    else:
-        _max_workers = max_workers
-
-    vertices: List[NDArrayFloat] = []
-
-    # Single worker (no multi-processing)
-    if _max_workers == 1:
-        for cell_id in range(n_cells):
-            vertices.append(
-                build_3d_cell_local(_halfspaces[cell_id], points[cell_id] + eps)
-            )
-    # Multi-processing enabled
-    else:
-        with ThreadPoolExecutor(max_workers=_max_workers) as executor:
-            vertices = list(
-                executor.map(
-                    build_3d_cell_local,
-                    _halfspaces,
-                    points + eps,
-                )
-            )
 
     # TODO: keep track of the cells/faces at the domain boundary
     # For each face => we build the halfspace + the projection on the domain and we keep
@@ -611,34 +976,12 @@ def voronoi_finite_cells(
     #     f"{n_cells} ({n_ext_cells / n_cells * 100.0:.2f}%)"
     # )
 
-    # Build unstructured grid
-    total_n_pts: int = 0
-    n_cells: int = 0
-    cells_def = []
+    # exterior_faces_idx, exterior_intersecting_faces_idx
 
-    for i, vertices_i in enumerate(vertices):
-        # Build the faces
-        if is_clip_to_domain:
-            vertices_i, faces = extract_faces_from_halfspaces_with_domain(
-                _halfspaces[i], vertices_i, domain
-            )
-        else:
-            vertices_i, faces = extract_faces_from_halfspaces(
-                _halfspaces[i],
-                vertices_i,
-            )
-        # number of vertices for the voronoi cell
-        n_pts = len(vertices_i)
-        # Add the number of faces
-        polyhedron_connectivity = [len(faces)]
-        # iterate faces and update the connectivity for each one
-        for f in faces:
-            polyhedron_connectivity += [len(f)] + list(np.array(f) + total_n_pts)
-        cells_def += [len(polyhedron_connectivity), *polyhedron_connectivity]
-        # update the total number of points
-        total_n_pts += n_pts
-        n_cells += 1
-
-    return pv.UnstructuredGrid(
-        np.array(cells_def), [pv.CellType.POLYHEDRON] * n_cells, np.vstack(vertices)
-    ).clean(tolerance=1e-10)
+    return _build_unstructured_grid(
+        vertices_per_cell,
+        halfspaces_per_cell,
+        domain,
+        is_clip_to_domain,
+        tolerance=1e-10,
+    )
