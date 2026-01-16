@@ -11,6 +11,60 @@ import numpy.typing as npt
 
 NDArrayFloat = npt.NDArray[np.float64]
 NDArrayInt = npt.NDArray[np.int64]
+NDArrayBool = npt.NDArray[np.bool_]
+
+
+def get_mask_points_in_domain(
+    points: NDArrayFloat,
+    domain: pv.PolyData,
+    tolerance: float = 0.001,
+    inside_out: bool = False,
+) -> NDArrayBool:
+    """
+    Mark points as to whether they are inside a closed surface.
+
+    Parameters
+    ----------
+    points: NDArrayFloat
+        Voronoi sites. Numpy array with shape (N, 3).
+    domain : pv.Polydata
+        Closed surface in which points must lie.
+    tolerancefloat, default: 0.001
+        The tolerance on the intersection. The tolerance is expressed as a fraction of the bounding box of the enclosing surface.
+    inside_outbool, default: False
+        By default, points inside the surface are marked inside or sent to the output. If inside_out is True, then the points outside the surface are marked inside.
+
+    Returns
+    -------
+    NDArrayInt
+        Mask array.
+
+    """
+    # mask for points inside the given polydata
+    inside_pts_mask = np.ones(shape=np.shape(points)[0], dtype=bool)
+    # initialize the valid points
+    valid_points = np.copy(points)
+    # initialize counters old/new
+    n_valid_points_old = np.size(valid_points) + 1
+    n_valid_points_new = n_valid_points_old - 1
+    # repeat the filtering operation as long as there is a change (this is because
+    # ``select_enclosed_points`` is not exact
+    while n_valid_points_new < n_valid_points_old:
+        # update the number of valid points
+        n_valid_points_old = np.size(valid_points)
+        # Update the mask
+        inside_pts_mask[inside_pts_mask] = (
+            pv.PolyData(valid_points)
+            .select_enclosed_points(
+                domain, check_surface=False, inside_out=inside_out, tolerance=tolerance
+            )["SelectedPoints"]
+            .view(bool)
+        )
+        # filter points
+        valid_points = points[inside_pts_mask]
+        # update comptor
+        n_valid_points_new = np.size(valid_points)
+    return inside_pts_mask
 
 
 def _make_sanity_checks(
@@ -41,7 +95,7 @@ def _make_sanity_checks(
             f"Points have shape {_shape} while the it should have shape (N, 3)!"
         )
     # Number of voronoi cells and dimension
-    n_cells, dim = _shape
+    _, dim = _shape
     # Check that points are 3D
     if dim != 3:
         raise ValueError(
@@ -983,11 +1037,7 @@ def voronoi_finite_cells(
     # TODO: wrap in a function
     # Flatten vertices before checking which are enclosed in the domain
     # so as to beneficiate from vectorization
-    vertices_in_domain = (
-        pv.PointSet(np.vstack(vertices_per_cell))
-        .select_enclosed_points(domain)["SelectedPoints"]
-        .view(bool)
-    )
+    vertices_in_domain = get_mask_points_in_domain(np.vstack(vertices_per_cell), domain)
 
     # Iterate the cells
     boundary_cell_ids = []
