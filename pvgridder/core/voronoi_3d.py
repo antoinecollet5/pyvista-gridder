@@ -65,18 +65,42 @@ def _make_sanity_checks(
         )
 
 
-def get_bounding_cube_coords(domain: pv.PolyData) -> NDArrayFloat:
+def get_bounding_cube_coords(domain: pv.PolyData, margin: float = 0.1) -> NDArrayFloat:
     """
     Return the coordinates of the bounding cube with shape (3, 2).
 
     ((x_min, x_max), (y_min, y_max), (z_min, z_max))
+
+    Parameters
+    ----------
+    domain: pv.PolyData
+        Closed surface in which the tesselation must occur.
+    margin: float = 0.1
+        Margin factor by which the bounding cube dimensions are increased.
+
     """
-    return np.reshape(domain.bounds, (2, -1), order="F").T
+    coords = np.reshape(domain.bounds, (2, -1), order="F").T
+    if margin != 0.0:
+        ext = np.diff(coords, axis=1).ravel() / 2.0 * (1 + margin)
+        mean = np.mean(coords, axis=1)
+        coords[:, 0] = mean - ext
+        coords[:, 1] = mean + ext
+    return coords
 
 
-def get_bounding_cube(domain: pv.PolyData) -> pv.Cube:
-    """Return a bounding cube."""
-    cube_coords = get_bounding_cube_coords(domain)
+def get_bounding_cube(domain: pv.PolyData, margin: float = 0.1) -> pv.Cube:
+    """
+    Return a bounding cube.
+
+    Parameters
+    ----------
+    domain: pv.PolyData
+        Closed surface in which the tesselation must occur.
+    margin: float = 0.1
+        Margin factor by which the bounding cube dimensions are increased.
+
+    """
+    cube_coords = get_bounding_cube_coords(domain, margin=margin)
     x_length, y_length, z_length = np.diff(cube_coords, axis=1)
     return pv.Cube(
         center=np.mean((cube_coords), axis=1),
@@ -243,7 +267,7 @@ def _build_halfspaces_per_cell(
     n_cells = len(points)
 
     # Step 1: extract the domain bouding cube coordinates and create the cube
-    cube_coords = get_bounding_cube_coords(domain)
+    cube_coords = get_bounding_cube_coords(domain, margin=0.1)
 
     # Step 2: create a plan projection for the cube
     bbox = np.array(
