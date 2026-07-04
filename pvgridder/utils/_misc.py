@@ -453,7 +453,7 @@ def extract_cell_geometry(
 
                 else:
                     raise NotImplementedError(
-                        f"cells of type '{celltype.name}' are not supported yet"
+                        f"cells of type '{pv.CellType(celltype).name}' are not supported yet"
                     )
 
                 cell_faces.append(cell_face)
@@ -578,6 +578,118 @@ def extract_cells_by_dimension(
         mesh = extract_cells(mesh, mask)
 
     return mesh
+
+
+def extract_layer(
+    mesh: pv.StructuredGrid | pv.UnstructuredGrid,
+    layer_id: int,
+    flatten: bool = True,
+) -> pv.UnstructuredGrid:
+    """
+    Extract a layer from a mesh generated with `pvgridder.MeshStack3D()` given its ID.
+
+    Parameters
+    ----------
+    mesh : pyvista.UnstructuredGrid
+        Mesh to extract a layer from.
+    layer_id : int
+        Layer ID to extract.
+    flatten : bool, default True
+        If True, flatten the extracted layer to 2D.
+
+    Returns
+    -------
+    pyvista.UnstructuredGrid
+        Mesh with extracted layer.
+
+    """
+    from .. import extract_cells, get_cell_connectivity
+
+    if "LayerId" not in mesh.cell_data:
+        raise ValueError(
+            "could not extract layer from mesh without 'LayerId' cell data"
+        )
+
+    layer_ids = mesh.cell_data["LayerId"]
+    layer = extract_cells(mesh, layer_ids == layer_id)
+
+    if not flatten:
+        return layer
+
+    connectivity = get_cell_connectivity(layer, flatten=False)
+    points, cells, celltypes = [], [], []
+    faces0, faces1 = [], []
+    n_points = 0
+    axis = None
+
+    for cell, celltype in zip(connectivity, layer.celltypes):
+        if celltype == pv.CellType.HEXAHEDRON:
+            face0, face1 = cell[:4], cell[4:]
+            facetype = pv.CellType.QUAD
+
+        elif celltype == pv.CellType.WEDGE:
+            face0, face1 = cell[:3], cell[3:]
+            facetype = pv.CellType.TRIANGLE
+
+        elif celltype == pv.CellType.POLYHEDRON:
+            face0, face1 = cell[0], cell[1]
+            facetype = pv.CellType.POLYGON
+
+        else:
+            raise ValueError(f"could not flatten cell of type '{celltype.name}'")
+
+        points0 = layer.points[face0]
+        points1 = layer.points[face1]
+
+        if celltype == pv.CellType.POLYHEDRON:
+            # Determine stacking axis once
+            if axis is None:
+                axis = [
+                    np.isin(points0[:, 0], points1[:, 0]).all(),
+                    np.isin(points0[:, 1], points1[:, 1]).all(),
+                    np.isin(points0[:, 2], points1[:, 2]).all(),
+                ]
+
+                if np.sum(axis) != 2:
+                    raise ValueError("could not determine stacking axis")
+
+                axis = np.flatnonzero(axis)
+
+            # Find sorting indices for face1 to match face0
+            ids = (
+                (points0[:, axis][:, None] == points1[:, axis])
+                .all(axis=-1)
+                .argmax(axis=1)
+            )
+
+        else:
+            ids = slice(None)
+
+        # Average cell points along stacking axis
+        cell_points = 0.5 * (points0 + points1[ids])
+        points.append(cell_points)
+        cells += [len(cell_points), *(np.arange(len(cell_points)) + n_points)]
+        celltypes.append(facetype)
+        faces0.append(face0)
+        faces1.append(face1[ids])
+        n_points += len(cell_points)
+
+    points = np.concatenate(points)
+    flat_layer = pv.UnstructuredGrid(cells, celltypes, points)
+
+    if layer.point_data:
+        faces0 = np.concatenate(faces0)
+        faces1 = np.concatenate(faces1)
+
+        for k, v in layer.point_data.items():
+            flat_layer.point_data[k] = 0.5 * (v[faces0] + v[faces1])
+
+    for k, v in layer.cell_data.items():
+        flat_layer.cell_data[k] = v
+
+    flat_layer.user_dict.update(layer.user_dict)
+
+    return cast(pv.UnstructuredGrid, flat_layer.clean(produce_merge_map=False))
 
 
 def fuse_cells(
@@ -1422,6 +1534,65 @@ def remap_categorical_data(
 
     if not inplace:
         return mesh
+
+
+def slice_vertical(
+    mesh: pv.DataSet, points: ArrayLike, clip: bool = True
+) -> pv.PolyData:
+    """
+    Extract a vertical slice from a 3D mesh along a polyline.
+
+    Parameters
+    ----------
+    mesh : pyvista.DataSet
+        Mesh to slice.
+    points : ArrayLike
+        Array of points defining the polyline along which to slice the mesh.
+    clip : bool, default True
+        Only used if there are exactly 2 points. If True, clip the slice to the line.
+
+    Returns
+    -------
+    pyvista.PolyData
+        Vertical slice of the mesh along the polyline.
+
+    """
+    from .. import get_dimension
+
+    if get_dimension(mesh) != 3:
+        raise ValueError("could not slice non 3D mesh")
+
+    points = np.atleast_2d(points)
+
+    if len(points) < 2:
+        raise ValueError("could not slice mesh with less than 2 points")
+
+    if points.shape[1] < 3:
+        points = np.insert(points, 2, 0.0, axis=1)
+
+    slices = []
+
+    for pointa, pointb in zip(points[:-1], points[1:]):
+        if clip or len(points) > 2:
+            slice_ = cast(
+                pv.UnstructuredGrid, mesh.clip(normal=pointa - pointb, origin=pointa)
+            )
+            slice_ = cast(
+                pv.UnstructuredGrid, slice_.clip(normal=pointb - pointa, origin=pointb)
+            )
+
+        else:
+            slice_ = mesh
+
+        normal = pv.Line(pointa, pointb).rotate_z(90.0, point=pointa)
+        slice_ = slice_.slice(
+            normal=normal.points[1] - normal.points[0],
+            origin=pointa,
+            generate_triangles=False,
+        )
+        slices.append(slice_)
+
+    return cast(pv.PolyData, pv.merge(slices) if len(slices) > 1 else slices[0])
 
 
 def split_lines(mesh: pv.PolyData, as_lines: bool = True) -> Sequence[pv.PolyData]:

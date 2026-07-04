@@ -9,6 +9,7 @@ from ._misc import (
     extract_cell_geometry,
     extract_cells,
     extract_cells_by_dimension,
+    extract_layer,
     fuse_cells,
     intersect_polyline,
     merge,
@@ -18,6 +19,7 @@ from ._misc import (
     ray_cast,
     reconstruct_line,
     remap_categorical_data,
+    slice_vertical,
     split_lines,
 )
 from ._properties import (
