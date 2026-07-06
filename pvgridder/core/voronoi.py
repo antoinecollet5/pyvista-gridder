@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Union, cast
+from typing import TYPE_CHECKING, Literal, Union, cast, Dict, List
 
 import numpy as np
 import pyvista as pv
@@ -18,6 +18,52 @@ if TYPE_CHECKING:
 
     from numpy.typing import ArrayLike  # pragma: no cover
     from typing_extensions import Self  # pragma: no cover
+
+
+@require_package("shapely>=2.0")
+class Polygon:
+    """Store a polygon selection used to override group/priority of Voronoi cells."""
+
+    from shapely import Polygon as ShapelyPolygon
+
+    def __init__(
+        self,
+        poly: ShapelyPolygon,
+        interior_poly: ShapelyPolygon,
+        group: str,
+        interior_group: str,
+        priority: int,
+        interior_priority: int,
+        add_central_cells: bool = False,
+    ) -> None:
+        """
+        Initialize the instance.
+
+        Parameters
+        ----------
+        poly : ShapelyPolygon
+            Polygon geometry (in the mesh's 2D plane) used to test containment/
+            intersection against Voronoi points and cells.
+        group : str
+            Group name assigned to cells selected by this polygon.
+        priority : int
+            Priority of this polygon. Only active cells with a (strictly) lower
+            priority than *priority* are overridden.
+        add_central_cells : bool, default False
+            If True, only cells whose Voronoi center lies inside *poly* are
+            selected (containment test only). If False, *poly* is treated as a
+            thin interface: cells whose Voronoi center lies outside the
+            background domain but whose Voronoi polygon intersects *poly* are
+            also selected, in addition to those contained by *poly*.
+
+        """
+        self.poly: ShapelyPolygon = poly
+        self.interior_poly: ShapelyPolygon = interior_poly
+        self.group: str = group
+        self.interior_group: str = interior_group
+        self.priority: int = priority
+        self.interior_priority: int = interior_priority
+        self.add_central_cells: bool = add_central_cells
 
 
 @require_package("shapely>=2.0")
@@ -58,6 +104,7 @@ class VoronoiMesh2D(MeshBase):
         self._preference = preference
         self._fuse_cells = []
         self.mesh.points[:, self.axis] = 0.0  # type: ignore
+        self._polygons: List[Polygon] = []
 
     def add(
         self,
@@ -190,6 +237,7 @@ class VoronoiMesh2D(MeshBase):
         resolution: Optional[int | ArrayLike] = None,
         priority: Optional[int] = None,
         group: Optional[str] = None,
+        add_central_cells: bool = True,
     ) -> Self:
         """
         Add points from a polyline to Voronoi diagram.
@@ -199,12 +247,14 @@ class VoronoiMesh2D(MeshBase):
         mesh_or_points : ArrayLike | pyvista.PolyData
             Dataset or coordinates of points.
         width : scalar
-            Width of polyline.
+            Width of polyline. If *add_central_cell* is False, this is simply
+            the distance separating the two constraint lines added on either
+            side of the polyline (no cells are generated between them).
         preference : {'cell', 'point'}, default 'cell'
             Determine which coordinates to add:
 
-             - if 'cell', add cell centers of polyline.
-             - if 'point', add polyline point coordinates.
+            - if 'cell', add cell centers of polyline.
+            - if 'point', add polyline point coordinates.
 
         padding : scalar, optional
             Distance between cell centers of first and last points (if
@@ -220,6 +270,14 @@ class VoronoiMesh2D(MeshBase):
             priority are discarded.
         group : str, optional
             Group name.
+        add_central_cells : bool, default True
+            If True, generate a finite-width band(s) of **cells** around
+            the polyline. Otherwise, treat the polyline as a zero-area
+            **interface**: only the two offset lines (`line_a`, `line_b`,
+            each offset by half of *width* on either side of the polyline)
+            are added to the Voronoi diagram as raw point sets. *width*
+            still controls how far apart these two lines are placed, but no
+            surface mesh or cells are built between them.
 
         Returns
         -------
@@ -243,8 +301,10 @@ class VoronoiMesh2D(MeshBase):
             constraint_start, constraint_end = constraint
 
         perc = resolution_to_perc(resolution)
-        perc = [2.0 * perc[0] - perc[1], *perc.tolist(), 2.0 * perc[-1] - perc[-2]]
-
+        if add_central_cells:
+            perc = [2.0 * perc[0] - perc[1], *perc.tolist(), 2.0 * perc[-1] - perc[-2]]
+        else:
+            perc = [-1.5, 0.5, 0.5, 2.5]
         # Loop over polylines
         for polyline in split_lines(mesh):
             # Remove axis from points
@@ -292,33 +352,225 @@ class VoronoiMesh2D(MeshBase):
             normals = 0.5 * (fnorm + bnorm)
             normals /= np.linalg.norm(normals, axis=1)[:, None]
 
-            # Generate structured grid with constraint cells
+            # Re-insert axis
             points = np.insert(points, self.axis, 0.0, axis=1)
             normals = np.insert(normals, self.axis, 0.0, axis=1)
 
-            tvec = 0.5 * width * normals
+            if add_central_cells:
+                tvec = 0.5 * width * normals
+            else:
+                tvec = 0.25 * width * normals
+
             line_a = points - tvec
             line_b = points + tvec
+
+            # Generate structured grid with constraint cells
             plane = "yz" if self.axis == 0 else "xz" if self.axis == 1 else "xy"
-            mesh = generate_surface_from_two_lines(line_a, line_b, plane, perc)
+            mesh_ = generate_surface_from_two_lines(line_a, line_b, plane, perc)
 
             # Identify constraint cells
-            shape = [n - 1 for n in mesh.dimensions if n != 1]
+            shape = [n - 1 for n in mesh_.dimensions if n != 1]
             constraint_ = np.ones(shape, dtype=bool)
             constraint_[constraint_start : shape[0] - constraint_end, 1:-1] = False
             constraint_ = constraint_.ravel(order="F")
 
             # Add to items
-            item = MeshItem(
-                extract_cells(mesh, ~constraint_),
-                group=group,
-                priority=priority if priority else 0,
-            )
+            if add_central_cells:
+                item = MeshItem(
+                    extract_cells(mesh_, ~constraint_),
+                    group=group,
+                    priority=priority if priority else 0,
+                )
+                self.items.append(item)
+
+            item = MeshItem(extract_cells(mesh_, constraint_), group=None, priority=0)
             self.items.append(item)
 
-            item = MeshItem(extract_cells(mesh, constraint_), group=None, priority=0)
+        return self
+
+    def add_polygon(
+        self,
+        mesh_or_points: ArrayLike | pv.PolyData | ShapelyPolygon,
+        width: float,
+        preference: Literal["cell", "point"] = "cell",
+        resolution: Optional[int | ArrayLike] = None,
+        priority: Optional[int] = None,
+        group: Optional[str] = None,
+        add_central_cells: bool = True,
+        interior_group: Optional[str] = None,
+        interior_priority: Optional[int] = None,
+    ) -> Self:
+        """
+        Add points from a closed polygon to Voronoi diagram.
+
+        Same as :meth:`add_polyline`, except the input line is treated as a
+        closed ring: direction vectors wrap around the seam instead of being
+        extrapolated as they would be for an open line, and the whole ring
+        forms a single band item.
+
+        Parameters
+        ----------
+        mesh_or_points : ArrayLike | pyvista.PolyData
+            Dataset or coordinates of points describing the polygon outline.
+            Does not need to be pre-closed; it is closed automatically if not.
+        width : scalar
+            Width of the band traced around the polygon outline. If
+            *add_central_cell* is False, this is simply the distance
+            separating the two constraint lines added on either side of the
+            outline (no wide band, just a thin interface).
+        preference : {'cell', 'point'}, default 'cell'
+            Determine which coordinates to add:
+
+            - if 'cell', use the midpoint of each outline edge.
+            - if 'point', use the outline vertices directly.
+
+        padding : scalar, optional
+            Unused for closed polygons (kept for signature parity with
+            *add_polyline*); there is no open start/end to pad.
+        resolution : int | ArrayLike, optional
+            Passed through to the surface generator (controls interpolation
+            from the inner to the outer offset line).
+        priority : int, default 0
+            Priority of the boundary band/interface item.
+        group : str, optional
+            Group name for the boundary band/interface.
+        add_central_cell : bool, default True
+            If True, generate a finite-width band of cells traced around the
+            polygon outline. If False, treat the outline as a thin interface:
+            the two offset lines are pulled in to a quarter of *width* on
+            each side instead of half.
+        interior_group : str, optional
+            If given, background points enclosed by the polygon outline are
+            also added to the Voronoi diagram and tagged with this group —
+            i.e. everything inside the polygon is selected as
+            *interior_group*.
+        interior_priority : int, optional
+            Priority of the interior region. Defaults to one more than
+            *priority*, so interior points take precedence over the boundary
+            band.
+
+        Returns
+        -------
+        Self
+            Self (for daisy chaining).
+
+        """
+        from shapely import (
+            Polygon as ShapelyPolygon,
+            MultiPolygon as ShapelyMultiPolygon,
+            contains,
+            points as shapely_points,
+        )
+        from .. import extract_cells, get_cell_centers, split_lines
+
+        if isinstance(mesh_or_points, ShapelyMultiPolygon):
+            for _poly in mesh_or_points.geoms:
+                self.add_polygon(
+                    mesh_or_points=_poly,
+                    width=width,
+                    preference=preference,
+                    resolution=resolution,
+                    priority=priority,
+                    group=group,
+                    add_central_cells=add_central_cells,
+                    interior_group=interior_group,
+                    interior_priority=interior_priority,
+                )
+            return self
+
+        if isinstance(mesh_or_points, ShapelyPolygon):
+            points_in = np.asanyarray(mesh_or_points.boundary.xy)
+            points_in = np.vstack([points_in, np.zeros(points_in.shape[1])]).T
+        elif not isinstance(mesh_or_points, pv.PolyData):
+            points_in = np.asanyarray(mesh_or_points)
+        else:
+            points_in = mesh_or_points.points
+
+        # Close the ring if it isn't already closed
+        if not np.allclose(points_in[0], points_in[-1]):
+            points_in = np.vstack((points_in, points_in[0]))
+
+        mesh = pv.MultipleLines(points_in)
+        perc = resolution_to_perc(resolution)
+        if add_central_cells:
+            perc = [2.0 * perc[0] - perc[1], *perc.tolist(), 2.0 * perc[-1] - perc[-2]]
+        else:
+            perc = [-1.5, 0.5, 0.5, 2.5]
+        # Loop over polylines
+        for polyline in split_lines(mesh):
+            # Remove axis from points; drop the repeated closing point and
+            # keep a copy of the raw outline for the interior containment test
+            points_raw = np.delete(polyline.points, self.axis, axis=1)[:-1]
+            points = points_raw
+
+            # Calculate new point coordinates if cell centers (wraps around)
+            if preference == "cell":
+                points = 0.5 * (points + np.roll(points, -1, axis=0))
+
+            # Calculate forward direction vectors
+            fdvec = np.diff(points, axis=0)
+            fdvec = np.vstack((fdvec, fdvec[-1]))
+
+            # Calculate backward direction vectors
+            bdvec = np.diff(points[::-1], axis=0)[::-1]
+            bdvec = np.vstack((bdvec[0], bdvec))
+
+            # Calculate normal vectors
+            fnorm = np.column_stack((-fdvec[:, 1], fdvec[:, 0]))
+            bnorm = np.column_stack((bdvec[:, 1], -bdvec[:, 0]))
+            normals = 0.5 * (fnorm + bnorm)
+            normals /= np.linalg.norm(normals, axis=1)[:, None]
+
+            # Re-insert axis
+            points = np.insert(points, self.axis, 0.0, axis=1)
+            normals = np.insert(normals, self.axis, 0.0, axis=1)
+
+            if add_central_cells:
+                tvec = 0.5 * width * normals
+            else:
+                tvec = 0.25 * width * normals
+
+            line_a = points - tvec
+            line_b = points + tvec
+
+            # Generate structured grid with constraint cells
+            plane = "yz" if self.axis == 0 else "xz" if self.axis == 1 else "xy"
+            mesh_ = generate_surface_from_two_lines(line_a, line_b, plane, perc)
+
+            # Identify constraint cells
+            shape = [n - 1 for n in mesh_.dimensions if n != 1]
+            constraint_ = np.ones(shape, dtype=bool)
+            constraint_[: shape[0], 1:-1] = False
+            constraint_ = constraint_.ravel(order="F")
+
+            # Add to items
+            if add_central_cells:
+                item = MeshItem(
+                    extract_cells(mesh_, ~constraint_),
+                    group=group,
+                    priority=priority if priority else 0,
+                )
+                self.items.append(item)
+
+            item = MeshItem(extract_cells(mesh_, constraint_), group=None, priority=0)
             self.items.append(item)
 
+            # Select background points inside the polygon and tag them as
+            # their own group -- mirrors how add_circle(plain=True) seeds a
+            # dense interior fill, but reuses the existing background
+            # resolution instead of generating a fresh mesh.
+            if interior_group is not None:
+                self._polygons.append(
+                    Polygon(
+                        poly=ShapelyPolygon(line_a) if add_central_cells else ShapelyPolygon(points_in),
+                        interior_poly=ShapelyPolygon(line_b),
+                        group=group,
+                        interior_group=interior_group,
+                        priority=priority,
+                        interior_priority=interior_priority,
+                        add_central_cells=add_central_cells,
+                    )
+                )
         return self
 
     def generate_mesh(
@@ -352,6 +604,7 @@ class VoronoiMesh2D(MeshBase):
             2D Voronoi mesh.
 
         """
+        import shapely
         from shapely import Polygon, get_coordinates
 
         from .. import (
@@ -383,7 +636,7 @@ class VoronoiMesh2D(MeshBase):
             points_ = get_cell_centers(mesh_a)
 
             # Remove out of bound points from item mesh
-            mask = self.mesh.find_containing_cell(get_cell_centers(mesh_a)) != -1
+            mask = self.mesh.find_containing_cell(points_) != -1
             mask = cast(NDArray, mask)
 
             if mask.any():
@@ -463,6 +716,7 @@ class VoronoiMesh2D(MeshBase):
         points, cells = [], []
         n_points = 0
 
+        polygons = []
         for i, region in enumerate(regions):
             polygon = Polygon(vertices[region])
 
@@ -470,6 +724,7 @@ class VoronoiMesh2D(MeshBase):
                 raise ValueError(f"region {i} is not a valid polygon")
 
             polygon = boundary.intersection(polygon)
+            polygons.append(polygon)
             points_ = get_coordinates(polygon)[:-1]
             cells += [len(points_), *(np.arange(len(points_)) + n_points)]
 
@@ -488,7 +743,37 @@ class VoronoiMesh2D(MeshBase):
         mesh = pv.PolyData(points, faces=cells)
         mesh = mesh.cast_to_unstructured_grid()
 
-        mesh.cell_data["CellGroup"] = group_array[active]
+        # Identify voronoi points outside the domain
+        _vp = shapely.points(voronoi_points)
+        _mask_vp_out = ~shapely.contains(boundary, _vp)
+        _poly_vp_out = np.array(polygons)[_mask_vp_out]
+
+        # Apply polygons selection => must account for polygons with voronoi centers
+        # outside the domain but intersecting the polygon.
+        active_group_array = group_array[active]
+        active_priority = priority_array[active]
+
+        for _poly in self._polygons:
+            # Condition 1: Must have higher priority
+            cond1 = active_priority < _poly.interior_priority
+            # Condition 2.1: The polygon must contain the voronoi center
+            if not _poly.add_central_cells:
+                cond2 = shapely.contains_properly(_poly.poly, _vp)
+            else:
+                cond2 = shapely.contains_properly(_poly.interior_poly, _vp)
+            if not _poly.add_central_cells:
+                # Condition 2.2: voronoi center outside domain AND polygon intersects
+                cond2_2 = np.zeros_like(cond1, dtype=bool)
+                cond2_2[_mask_vp_out] = shapely.intersects(_poly_vp_out, _poly.poly)
+                # Combine: cond1 AND (cond2_1 OR cond2_2)
+                cond2 = np.logical_or(cond2, cond2_2)
+
+            mask = np.logical_and(cond1, cond2)
+            active_priority[mask] = _poly.interior_priority
+            active_group_array[mask] = self._get_group_number(_poly.interior_group, groups)
+
+        # Add the updated groups to the mesh
+        mesh.cell_data["CellGroup"] = active_group_array
         mesh.user_dict["CellGroup"] = groups
         _ = mesh.set_active_scalars("CellGroup", preference="cell")
 
